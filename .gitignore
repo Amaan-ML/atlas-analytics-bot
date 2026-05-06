@@ -1,0 +1,6 @@
+.env
+bq-service-account.json
+atlas_logs.jsonl
+venv/
+__pycache__/
+src/__pycache__/
