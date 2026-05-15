@@ -9,10 +9,13 @@ import json
 from logger import log_question
 import time
 
-def safe_say(say, text, thread_ts, retries=3):
+def safe_say(say, text, thread_ts=None, retries=3):
     for i in range(retries):
         try:
-            return say(text, thread_ts=thread_ts)
+            if thread_ts:
+                return say(text, thread_ts=thread_ts)
+            else:
+                return say(text)
         except Exception as e:
             if i < retries - 1:
                 time.sleep(2)
@@ -22,6 +25,15 @@ def safe_say(say, text, thread_ts, retries=3):
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+
+# Fetch bot's own user ID so we can detect @mentions in DM messages
+BOT_USER_ID = None
+try:
+    auth_response = app.client.auth_test()
+    BOT_USER_ID = auth_response["user_id"]
+    print(f"Bot user ID: {BOT_USER_ID}")
+except Exception as e:
+    print(f"Could not fetch bot user ID: {e}")
 
 client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -87,19 +99,23 @@ tools = [
 ]
 
 
-def process_message(thread_ts, user_text, say, user_id):
-    if thread_ts not in conversation:
-        conversation[thread_ts] = []
-    conversation[thread_ts].append({"role": "user", "content": user_text})
-    log_question(user_id, user_text, None, thread_ts)
+def process_message(convo_key, user_text, say, user_id, thread_ts=None):
+    """
+    convo_key:  unique key for conversation history storage.
+    thread_ts:  the Slack thread timestamp to reply into.
+    """
+    if convo_key not in conversation:
+        conversation[convo_key] = []
+    conversation[convo_key].append({"role": "user", "content": user_text})
+    log_question(user_id, user_text, None, convo_key)
 
     while True:
         response = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-opus-4-6",
             system=SYSTEM_PROMPT,
             max_tokens=1024,
             tools=tools,
-            messages=conversation[thread_ts],
+            messages=conversation[convo_key],
         )
 
         content = []
@@ -109,11 +125,11 @@ def process_message(thread_ts, user_text, say, user_id):
             elif block.type == "tool_use":
                 content.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
 
-        conversation[thread_ts].append({"role": "assistant", "content": content})
+        conversation[convo_key].append({"role": "assistant", "content": content})
 
         if response.stop_reason == "tool_use":
-            say("on it, give me a sec...", thread_ts=thread_ts)
-            
+            safe_say(say, "on it, give me a sec...", thread_ts=thread_ts)
+
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -130,32 +146,56 @@ def process_message(thread_ts, user_text, say, user_id):
                         "tool_use_id": block.id,
                         "content": str(result)
                     })
-            conversation[thread_ts].append({"role": "user", "content": tool_results})
+            conversation[convo_key].append({"role": "user", "content": tool_results})
         else:
             reply = response.content[0].text
             break
 
-    say(reply, thread_ts=thread_ts)
+    safe_say(say, reply, thread_ts=thread_ts)
 
 
 @app.event("app_mention")
 def handle_mention(event, say):
+    """Handles @mentions in channels (Slack sends these as app_mention events)."""
     if event.get("bot_id"):
         return
     user_text = event["text"]
     thread_ts = event.get("thread_ts", event["ts"])
-    process_message(thread_ts, user_text, say, event.get("user", "unknown"))
+    process_message(thread_ts, user_text, say, event.get("user", "unknown"), thread_ts=thread_ts)
+
 
 @app.event("message")
 def handle_message(event, say):
+    """
+    Handles:
+    1. @mentions in DMs (Slack sends these as message events, not app_mention)
+    2. Follow-up messages in any existing thread (channels or DMs)
+    """
     if event.get("bot_id"):
         return
+    if event.get("subtype"):
+        return
+
+    user_text = event.get("text", "")
     thread_ts = event.get("thread_ts")
-    if thread_ts and thread_ts in conversation:
-        user_text = event["text"]
-        process_message(thread_ts, user_text, say, event.get("user", "unknown"))
+
+    # Check if bot was @mentioned in the message text
+    bot_mentioned = BOT_USER_ID and f"<@{BOT_USER_ID}>" in user_text
+
+    if bot_mentioned and not thread_ts:
+        # New @mention (in DM) — start a new thread from this message
+        msg_ts = event["ts"]
+        process_message(msg_ts, user_text, say, event.get("user", "unknown"), thread_ts=msg_ts)
+    elif thread_ts and thread_ts in conversation:
+        # Follow-up in an existing thread — continue the conversation
+        process_message(thread_ts, user_text, say, event.get("user", "unknown"), thread_ts=thread_ts)
+
 
 if __name__ == "__main__":
-    handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
-    handler.start() 
-
+    try:
+        handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
+        handler.start()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
